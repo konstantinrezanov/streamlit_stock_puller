@@ -1,5 +1,7 @@
 streamlit>=1.32
 pandas>=2.0
-yfinance
+yfinance>=0.2.37
 xlsxwriter>=3.1
-openpyxl
+openpyxl>=3.1
+aiomoex
+aiohttp>=3.9

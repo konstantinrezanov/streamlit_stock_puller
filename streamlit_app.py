@@ -4,9 +4,13 @@ from datetime import date, timedelta
 
 import json
 
+import asyncio
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import aiohttp
+import aiomoex
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -16,7 +20,7 @@ st.set_page_config(
 )
 
 # ---------- Helpers ----------
-REQUIRED_COLUMNS = ["No", "Name", "Ticker"]
+REQUIRED_COLUMNS = ["No", "Name", "Ticker", "IsRussian"]
 
 TAB_LABELS = ["Build workbook", "Search ticker"]
 TAB_TO_SLUG = {
@@ -47,6 +51,21 @@ def _flatten_col_label(label) -> str:
     return str(label).strip()
 
 
+def _normalize_header(name: str) -> str:
+    return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
+
+
+def _run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
 def get_query_params() -> dict:
     if hasattr(st, "query_params"):
         return dict(st.query_params)
@@ -75,21 +94,34 @@ def normalize_companies_df(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = [_flatten_col_label(col) for col in df.columns]
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Try to find required columns with case-insensitivity
+    # Try to find required columns with normalized comparison
     colmap = {}
     for need in REQUIRED_COLUMNS:
-        candidates = [c for c in df.columns if c.lower() == need.lower()]
+        candidates = [c for c in df.columns if _normalize_header(c) == _normalize_header(need)]
         if not candidates:
             raise ValueError(f"Missing required column: '{need}'")
         colmap[need] = candidates[0]
 
     # Reorder and return
-    df = df[[colmap["No"], colmap["Name"], colmap["Ticker"]]]
-    # Optional: coerce No to string to ensure valid sheet names later
+    df = df[[colmap["No"], colmap["Name"], colmap["Ticker"], colmap["IsRussian"]]]
+    df = df.rename(columns={
+        colmap["No"]: "No",
+        colmap["Name"]: "Name",
+        colmap["Ticker"]: "Ticker",
+        colmap["IsRussian"]: "IsRussian",
+    })
+
     df["No"] = df["No"].astype(str).str.strip()
     df["Name"] = df["Name"].astype(str).str.strip()
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
-    return df.rename(columns={"No": "No", "Name": "Name", "Ticker": "Ticker"})
+    df["IsRussian"] = (
+        df["IsRussian"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin({"1", "y", "yes", "true", "да", "ru", "russia"})
+    )
+    return df
 
 def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.DataFrame:
     """
@@ -170,6 +202,54 @@ def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.Data
     df["Date"] = pd.to_datetime(df["Date"]).dt.date
     return df[["Date", "Price", "Open", "High", "Low", "Volume"]]
 
+
+def fetch_history_for_russian_ticker(ticker: str, start_d: date, end_d: date) -> pd.DataFrame:
+    async def _fetch():
+        async with aiohttp.ClientSession() as session:
+            return await aiomoex.get_board_history(
+                session,
+                ticker,
+                start=start_d.isoformat(),
+                end=end_d.isoformat(),
+            )
+
+    try:
+        data = _run_async(_fetch())
+    except Exception:
+        data = []
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    if st.session_state.get("show_raw_yf"):
+        st.write(f"Raw MOEX output for {ticker}")
+        st.write("Columns:", list(df.columns))
+        st.dataframe(df.head())
+
+    normalized_cols = { _normalize_header(col): col for col in df.columns }
+
+    date_col = normalized_cols.get("tradedate") or normalized_cols.get("date")
+    price_col = normalized_cols.get("close")
+    volume_col = normalized_cols.get("volume") or normalized_cols.get("vol")
+
+    if not all([date_col, price_col, volume_col]):
+        return pd.DataFrame()
+
+    result = pd.DataFrame({
+        "Date": pd.to_datetime(df[date_col]).dt.date,
+        "Price": pd.to_numeric(df[price_col], errors="coerce"),
+        "Volume": pd.to_numeric(df[volume_col], errors="coerce"),
+    })
+
+    # MOEX endpoint does not expose open/high/low in this mode; duplicate Price for consistency
+    result["Open"] = result["Price"]
+    result["High"] = result["Price"]
+    result["Low"] = result["Price"]
+
+    return result[["Date", "Price", "Open", "High", "Low", "Volume"]]
+
 def autosize_columns(writer, sheet_name: str, df: pd.DataFrame, start_row=0, start_col=0, extra_pad=2):
     """Autosize Excel columns based on dataframe content lengths."""
     worksheet = writer.sheets[sheet_name]
@@ -230,17 +310,32 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
 def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date) -> bytes:
     """Build the Excel workbook in-memory and return as bytes."""
     output = io.BytesIO()
+    total = len(companies_df)
+    progress_bar = st.progress(0.0, text="Preparing to fetch data…")
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd", date_format="yyyy-mm-dd") as writer:
         # Sheet 1: companies (as provided)
         companies_df.to_excel(writer, sheet_name="companies", index=False)
         autosize_columns(writer, "companies", companies_df, start_row=0, start_col=0, extra_pad=2)
 
         # Per company sheets
-        for _, row in companies_df.iterrows():
-            sheet_name = str(row["No"])[:31]  # Excel sheet name limit
-            ticker = str(row["Ticker"]).strip()
+        for idx, row in enumerate(companies_df.itertuples(index=False), start=1):
+            sheet_name = str(getattr(row, "No"))[:31]  # Excel sheet name limit
+            ticker = str(getattr(row, "Ticker")).strip()
+            company_name = str(getattr(row, "Name"))
+            is_russian = bool(getattr(row, "IsRussian"))
 
-            prices_df = fetch_history_for_ticker(ticker, start_d, end_d)
+            if total:
+                progress_value = (idx - 1) / total
+            else:
+                progress_value = 0.0
+
+            progress_text = f"Fetching {company_name} ({ticker}) — {idx}/{total}"
+            progress_bar.progress(progress_value, text=progress_text)
+
+            if is_russian:
+                prices_df = fetch_history_for_russian_ticker(ticker, start_d, end_d)
+            else:
+                prices_df = fetch_history_for_ticker(ticker, start_d, end_d)
             # If empty, still create a sheet with headers and a note
             if prices_df.empty:
                 empty_df = pd.DataFrame(columns=["Date", "Price", "Open", "High", "Low", "Volume"])
@@ -250,6 +345,8 @@ def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date)
                 autosize_columns(writer, sheet_name, empty_df, start_row=0, start_col=0, extra_pad=2)
             else:
                 write_company_sheet(writer, sheet_name, prices_df)
+
+        progress_bar.progress(1.0 if total else 1.0, text="All tickers fetched. Building workbook…")
 
     return output.getvalue()
 
@@ -336,7 +433,7 @@ st.markdown(
 with tab_build:
     st.subheader("1) Upload companies list")
     uploaded = st.file_uploader(
-        "Upload an Excel file (.xlsx) with columns: No, Name, Ticker",
+        "Upload an Excel file (.xlsx) with columns: No, Name, Ticker, IsRussian",
         type=["xlsx"],
         accept_multiple_files=False
     )
@@ -419,5 +516,5 @@ with tab_search:
 set_query_params(tab=active_tab_slug)
 
 # Footer note
-st.caption("Tip: Ensure your Excel headers are exactly 'No', 'Name', 'Ticker'. "
-           "The app uses the 'Close' price as 'Price' for VWAP calculation.")
+st.caption("Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
+           "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance.")
