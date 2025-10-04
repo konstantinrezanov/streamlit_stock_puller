@@ -3,7 +3,6 @@ import io
 from datetime import date, timedelta
 
 import json
-from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -36,6 +35,18 @@ def _first_value(value):
     return str(value)
 
 
+def _flatten_col_label(label) -> str:
+    if isinstance(label, tuple):
+        for part in label:
+            if part is None:
+                continue
+            part_str = str(part).strip()
+            if part_str:
+                return part_str
+        return ""
+    return str(label).strip()
+
+
 def get_query_params() -> dict:
     if hasattr(st, "query_params"):
         return dict(st.query_params)
@@ -60,7 +71,9 @@ def normalize_companies_df(df: pd.DataFrame) -> pd.DataFrame:
     """Validate and normalize the uploaded companies table."""
     # Normalize column names (strip spaces, case-insensitive match)
     df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [_flatten_col_label(col) for col in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
     # Try to find required columns with case-insensitivity
     colmap = {}
@@ -100,10 +113,56 @@ def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.Data
     if df is None or df.empty:
         return pd.DataFrame()
 
+    if st.session_state.get("show_raw_yf"):
+        st.write(f"Raw yfinance output for {ticker}")
+        st.write("Columns:", list(df.columns))
+        st.dataframe(df.head())
+
     df = df.reset_index()  # bring Date from index to column
-    # Standardize column names to a consistent set
-    needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    df = df[needed]
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [_flatten_col_label(col) for col in df.columns]
+
+    def _norm_key(name: str) -> str:
+        return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+    candidates = [
+        ("open", "open"),
+        ("regularmarketopen", "open"),
+        ("high", "high"),
+        ("low", "low"),
+        ("close", "close"),
+        ("adjclose", "close"),
+        ("regularmarketclose", "close"),
+        ("volume", "volume"),
+        ("regularmarketvolume", "volume"),
+    ]
+
+    colmap = {"open": None, "high": None, "low": None, "close": None, "volume": None}
+    for col in df.columns:
+        key = _norm_key(col)
+        for cand_key, target in candidates:
+            if colmap[target] is None and key == cand_key:
+                colmap[target] = col
+                break
+
+    try:
+        date_col = next(c for c in df.columns if _norm_key(c) in {"date", "datetime"})
+    except StopIteration:
+        date_col = df.columns[0]
+
+    if any(value is None for value in colmap.values()):
+        return pd.DataFrame()
+
+    ordered_cols = [colmap[label] for label in ["open", "high", "low", "close", "volume"]]
+    df = df[[date_col, *ordered_cols]]
+    df = df.rename(columns={
+        date_col: "Date",
+        colmap["open"]: "Open",
+        colmap["high"]: "High",
+        colmap["low"]: "Low",
+        colmap["close"]: "Close",
+        colmap["volume"]: "Volume",
+    })
     # Rename to requested (English equivalents of Russian labels):
     # Дата -> Date, Цена -> Price (using Close), Откр. -> Open, Макс. -> High, Мин. -> Low, Объём -> Volume
     df = df.rename(columns={"Close": "Price"})
@@ -129,6 +188,8 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
     - On the right, place a VWAP (weighted mean price) computed via SUMPRODUCT.
     """
     df_prices = df_prices.copy()
+    if isinstance(df_prices.columns, pd.MultiIndex):
+        df_prices.columns = [_flatten_col_label(col) for col in df_prices.columns]
     df_prices.index += 1  # not necessary, but keeps mental mapping simple
 
     df_prices.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0, startcol=0)
@@ -202,7 +263,7 @@ active_tab_slug = tab_slug_from_url
 
 st.title("Ticker Workbook Builder")
 
-tab_build, tab_test, tab_search = st.tabs(TAB_LABELS)
+tab_build, tab_search = st.tabs(TAB_LABELS)
 
 tab_mapping_js = json.dumps(TAB_TO_SLUG)
 desired_slug_js = json.dumps(active_tab_slug)
@@ -232,9 +293,6 @@ st.markdown(
                     }}
                     const url = new URL(root.location.href);
                     url.searchParams.set('tab', slug);
-                    if (slug !== 'test') {{
-                        url.searchParams.delete('ticker');
-                    }}
                     const query = url.searchParams.toString();
                     const newUrl = query ? `${{url.pathname}}?${{query}}` : url.pathname;
                     root.history.replaceState(null, '', newUrl);
@@ -283,6 +341,8 @@ with tab_build:
         accept_multiple_files=False
     )
 
+    st.checkbox("Show raw yfinance responses while building", key="show_raw_yf")
+
     st.subheader("2) Select date range")
     today = date.today()
     default_start = today - timedelta(days=365)
@@ -326,37 +386,6 @@ with tab_build:
                     "columns [Date, Price, Open, High, Low, Volume] plus a VWAP "
                     "(weighted mean price) computed with Excel SUMPRODUCT."
                 )
-
-with tab_test:
-    st.subheader("Quick ticker test")
-    test_ticker = st.text_input(
-        "Enter a ticker symbol (e.g., AAPL, MSFT, TSLA):",
-        key="test_ticker_input"
-    )
-    run_test = st.button("Fetch last 10 data points", use_container_width=True)
-
-    if run_test:
-        t = test_ticker.strip()
-        if not t:
-            st.error("Please enter a ticker symbol.")
-        else:
-            with st.spinner("Fetching data…"):
-                # Last 10 trading days (approx. we request 30 calendar days and then tail 10)
-                end_d = date.today()
-                start_d = end_d - timedelta(days=30)
-                df_test = fetch_history_for_ticker(t, start_d, end_d)
-
-            if df_test.empty:
-                st.warning("No data found for this ticker in the recent period.")
-            else:
-                df_last10 = df_test.tail(10).reset_index(drop=True)
-                st.dataframe(df_last10, use_container_width=True)
-                # Optional: simple line chart for Price
-                try:
-                    st.line_chart(df_last10.set_index("Date")["Price"])
-                except Exception:
-                    pass
-
 with tab_search:
     st.subheader("Search for tickers (via yfinance.Search)")
 
@@ -373,16 +402,12 @@ with tab_search:
                 results = []
                 for q in quotes:
                     symbol = q.get("symbol")
-                    deep_link = ""
-                    if symbol:
-                        deep_link = f"?tab={TAB_TO_SLUG['Test ticker']}&ticker={quote(str(symbol))}"
                     results.append({
                         "Symbol": symbol,
                         "Name": q.get("shortname"),
                         "Type": q.get("quoteType"),
                         "Exchange": q.get("exchange"),
                         "Currency": q.get("currency"),
-                        "Test in app": f"<a href=\"{deep_link}\">Open test tab</a>" if deep_link else "",
                         "Link": f"https://finance.yahoo.com/quote/{symbol}" if symbol else ""
                     })
                 df_results = pd.DataFrame(results)
@@ -391,13 +416,7 @@ with tab_search:
         except Exception as e:
             st.error(f"Search failed: {e}")
 
-current_ticker_value = st.session_state.get("test_ticker_input", "").strip()
-params_to_set = {"tab": active_tab_slug}
-if active_tab_slug == TAB_TO_SLUG["Test ticker"] and current_ticker_value:
-    params_to_set["ticker"] = current_ticker_value
-
-set_query_params(**params_to_set)
-st.session_state["_url_synced_ticker"] = params_to_set.get("ticker", "")
+set_query_params(tab=active_tab_slug)
 
 # Footer note
 st.caption("Tip: Ensure your Excel headers are exactly 'No', 'Name', 'Ticker'. "
