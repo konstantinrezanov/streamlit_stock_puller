@@ -316,6 +316,7 @@ def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date)
         # Sheet 1: companies (as provided)
         companies_df.to_excel(writer, sheet_name="companies", index=False)
         autosize_columns(writer, "companies", companies_df, start_row=0, start_col=0, extra_pad=2)
+        companies_ws = writer.sheets["companies"]
 
         # Per company sheets
         for idx, row in enumerate(companies_df.itertuples(index=False), start=1):
@@ -345,6 +346,16 @@ def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date)
                 autosize_columns(writer, sheet_name, empty_df, start_row=0, start_col=0, extra_pad=2)
             else:
                 write_company_sheet(writer, sheet_name, prices_df)
+
+            # Add hyperlink from companies sheet "No" column to the corresponding sheet
+            link_cell = f"A{idx + 1}"
+            display_text = str(getattr(row, "No"))
+            sheet_ref = sheet_name.replace("'", "''")  # escape single quotes for Excel
+            companies_ws.write_url(
+                link_cell,
+                f"internal:'{sheet_ref}'!A1",
+                string=display_text
+            )
 
         progress_bar.progress(1.0 if total else 1.0, text="All tickers fetched. Building workbook…")
 
