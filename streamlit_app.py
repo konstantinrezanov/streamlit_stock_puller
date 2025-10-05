@@ -1,5 +1,6 @@
 # streamlit_app.py
 import io
+import calendar
 from datetime import date, timedelta
 
 import json
@@ -11,6 +12,7 @@ import streamlit as st
 import yfinance as yf
 import aiohttp
 import aiomoex
+from xlsxwriter.utility import xl_col_to_name
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -53,6 +55,17 @@ def _flatten_col_label(label) -> str:
 
 def _normalize_header(name: str) -> str:
     return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
+
+
+def quarter_date_range(year: int, quarter: int) -> tuple[date, date]:
+    if quarter not in (1, 2, 3, 4):
+        raise ValueError("Quarter must be between 1 and 4")
+    start_month = (quarter - 1) * 3 + 1
+    start = date(year, start_month, 1)
+    end_month = start_month + 2
+    last_day = calendar.monthrange(year, end_month)[1]
+    end = date(year, end_month, last_day)
+    return start, end
 
 
 def _run_async(coro):
@@ -270,7 +283,25 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
     df_prices = df_prices.copy()
     if isinstance(df_prices.columns, pd.MultiIndex):
         df_prices.columns = [_flatten_col_label(col) for col in df_prices.columns]
-    df_prices.index += 1  # not necessary, but keeps mental mapping simple
+
+    base_columns = ["Date", "Price", "Open", "High", "Low", "Volume"]
+    has_period = "Period" in df_prices.columns
+    if has_period:
+        columns_order = ["Period", *base_columns]
+    else:
+        columns_order = base_columns
+
+    for col in columns_order:
+        if col not in df_prices.columns:
+            df_prices[col] = pd.NA
+
+    df_prices = df_prices[columns_order]
+
+    for numeric_col in ["Price", "Open", "High", "Low", "Volume"]:
+        if numeric_col in df_prices.columns:
+            df_prices[numeric_col] = pd.to_numeric(df_prices[numeric_col], errors="coerce")
+    if "Date" in df_prices.columns:
+        df_prices["Date"] = pd.to_datetime(df_prices["Date"]).dt.date
 
     df_prices.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0, startcol=0)
     worksheet = writer.sheets[sheet_name]
@@ -282,32 +313,69 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
     date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
     bold_fmt = workbook.add_format({"bold": True})
 
-    nrows = len(df_prices)
-    # Apply basic column formats
-    # A: Date, B: Price, C: Open, D: High, E: Low, F: Volume
-    worksheet.set_column("A:A", 12, date_fmt)
-    worksheet.set_column("B:E", 12, money_fmt)
-    worksheet.set_column("F:F", 12, int_fmt)
+    start_col = 0
+    for idx, col_name in enumerate(columns_order):
+        excel_col = start_col + idx
+        if col_name == "Date":
+            worksheet.set_column(excel_col, excel_col, 12, date_fmt)
+        elif col_name in {"Price", "Open", "High", "Low"}:
+            worksheet.set_column(excel_col, excel_col, 12, money_fmt)
+        elif col_name == "Volume":
+            worksheet.set_column(excel_col, excel_col, 12, int_fmt)
+        else:
+            worksheet.set_column(excel_col, excel_col, 14)
 
     # Autosize to content as well
     autosize_columns(writer, sheet_name, df_prices, start_row=0, start_col=0, extra_pad=2)
 
-    # Place VWAP (Close*Volume / Volume) using SUMPRODUCT to the right of the table
-    # We'll use columns G (label) and H (value)
-    label_cell = "G2"
-    value_cell = "H2"
-    worksheet.write(label_cell, "VWAP (Price × Volume)", bold_fmt)
+    # Build VWAP summary using Excel formulas
+    summary_col = start_col + len(columns_order) + 1
+    worksheet.write(0, summary_col, "VWAP period", bold_fmt)
+    worksheet.write(0, summary_col + 1, "Value", bold_fmt)
 
-    # Data cells (Excel is 1-based; our header is on row 1)
-    # Prices: B2:B{n+1}, Volume: F2:F{n+1}
-    start_row = 2
-    end_row = nrows + 1
-    price_range = f"B{start_row}:B{end_row}"
-    vol_range = f"F{start_row}:F{end_row}"
-    vwap_formula = f"=IFERROR(SUMPRODUCT({price_range},{vol_range})/SUM({vol_range}), \"\")"
-    worksheet.write_formula(value_cell, vwap_formula, money_fmt)
+    def period_rows(label: str) -> tuple[int, int] | None:
+        if not has_period:
+            return None
+        matches = df_prices.index[df_prices["Period"] == label].tolist()
+        if not matches:
+            return None
+        start_row = matches[0] + 2  # Excel is 1-based and header occupies row 1
+        end_row = matches[-1] + 2
+        return start_row, end_row
 
-def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date) -> bytes:
+    current_summary_row = 1
+    if has_period:
+        unique_periods = list(dict.fromkeys(df_prices["Period"].dropna().tolist()))
+        for period_label in unique_periods:
+            rows = period_rows(period_label)
+            if not rows:
+                continue
+            start_row, end_row = rows
+            worksheet.write(current_summary_row, summary_col, str(period_label))
+            price_col_letter = xl_col_to_name(columns_order.index("Price"))
+            volume_col_letter = xl_col_to_name(columns_order.index("Volume"))
+            formula = (
+                f"=IFERROR(SUMPRODUCT({price_col_letter}{start_row}:{price_col_letter}{end_row},"
+                f"{volume_col_letter}{start_row}:{volume_col_letter}{end_row})/"
+                f"SUM({volume_col_letter}{start_row}:{volume_col_letter}{end_row}),\"\")"
+            )
+            worksheet.write_formula(current_summary_row, summary_col + 1, formula, money_fmt)
+            current_summary_row += 1
+
+    # Overall VWAP
+    worksheet.write(current_summary_row, summary_col, "Overall")
+    price_col_letter = xl_col_to_name(columns_order.index("Price"))
+    volume_col_letter = xl_col_to_name(columns_order.index("Volume"))
+    overall_start = 2
+    overall_end = len(df_prices) + 1
+    overall_formula = (
+        f"=IFERROR(SUMPRODUCT({price_col_letter}{overall_start}:{price_col_letter}{overall_end},"
+        f"{volume_col_letter}{overall_start}:{volume_col_letter}{overall_end})/"
+        f"SUM({volume_col_letter}{overall_start}:{volume_col_letter}{overall_end}),\"\")"
+    )
+    worksheet.write_formula(current_summary_row, summary_col + 1, overall_formula, money_fmt)
+
+def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> bytes:
     """Build the Excel workbook in-memory and return as bytes."""
     output = io.BytesIO()
     total = len(companies_df)
@@ -319,33 +387,65 @@ def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date)
         companies_ws = writer.sheets["companies"]
 
         # Per company sheets
+        per_company_periods = periods or []
+        period_count = max(len(per_company_periods), 1)
+
         for idx, row in enumerate(companies_df.itertuples(index=False), start=1):
             sheet_name = str(getattr(row, "No"))[:31]  # Excel sheet name limit
             ticker = str(getattr(row, "Ticker")).strip()
             company_name = str(getattr(row, "Name"))
             is_russian = bool(getattr(row, "IsRussian"))
 
-            if total:
-                progress_value = (idx - 1) / total
-            else:
-                progress_value = 0.0
+            collected_frames: list[pd.DataFrame] = []
 
-            progress_text = f"Fetching {company_name} ({ticker}) — {idx}/{total}"
-            progress_bar.progress(progress_value, text=progress_text)
+            if per_company_periods:
+                for period_idx, period in enumerate(per_company_periods, start=1):
+                    if total:
+                        progress_value = ((idx - 1) + (period_idx - 1) / period_count) / total
+                    else:
+                        progress_value = 0.0
 
-            if is_russian:
-                prices_df = fetch_history_for_russian_ticker(ticker, start_d, end_d)
+                    progress_text = (
+                        f"Fetching {company_name} ({ticker}) — {idx}/{total} · {period['label']}"
+                    )
+                    progress_bar.progress(progress_value, text=progress_text)
+
+                    if is_russian:
+                        period_df = fetch_history_for_russian_ticker(
+                            ticker,
+                            period["start"],
+                            period["end"],
+                        )
+                    else:
+                        period_df = fetch_history_for_ticker(
+                            ticker,
+                            period["start"],
+                            period["end"],
+                        )
+
+                    if not period_df.empty:
+                        period_df = period_df.copy()
+                        period_df["Period"] = period["label"]
+                        collected_frames.append(period_df)
             else:
-                prices_df = fetch_history_for_ticker(ticker, start_d, end_d)
-            # If empty, still create a sheet with headers and a note
-            if prices_df.empty:
-                empty_df = pd.DataFrame(columns=["Date", "Price", "Open", "High", "Low", "Volume"])
+                if total:
+                    progress_value = (idx - 1) / total
+                else:
+                    progress_value = 0.0
+                progress_bar.progress(progress_value, text=f"Fetching {company_name} ({ticker}) — {idx}/{total}")
+
+            if collected_frames:
+                prices_df = pd.concat(collected_frames, ignore_index=True)
+                prices_df = prices_df.sort_values(["Period", "Date"]).reset_index(drop=True)
+                write_company_sheet(writer, sheet_name, prices_df)
+            else:
+                empty_df = pd.DataFrame(
+                    columns=["Period", "Date", "Price", "Open", "High", "Low", "Volume"]
+                )
                 empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
                 worksheet = writer.sheets[sheet_name]
                 worksheet.write("H2", "No data for the selected range/ticker.")
                 autosize_columns(writer, sheet_name, empty_df, start_row=0, start_col=0, extra_pad=2)
-            else:
-                write_company_sheet(writer, sheet_name, prices_df)
 
             # Add hyperlink from companies sheet "No" column to the corresponding sheet
             link_cell = f"A{idx + 1}"
@@ -357,7 +457,10 @@ def build_workbook_bytes(companies_df: pd.DataFrame, start_d: date, end_d: date)
                 string=display_text
             )
 
-        progress_bar.progress(1.0 if total else 1.0, text="All tickers fetched. Building workbook…")
+        if total:
+            progress_bar.progress(1.0, text="All tickers fetched. Building workbook…")
+        else:
+            progress_bar.progress(1.0, text="No companies supplied.")
 
     return output.getvalue()
 
@@ -451,18 +554,48 @@ with tab_build:
 
     st.checkbox("Show raw yfinance responses while building", key="show_raw_yf")
 
-    st.subheader("2) Select date range")
     today = date.today()
-    default_start = today - timedelta(days=365)
-    start_date = st.date_input("Start date", value=default_start)
-    end_date = st.date_input("End date", value=today)
 
-    if start_date > end_date:
-        st.error("Start date must be on or before End date.")
+    st.subheader("2) Select quarters")
+    quarter_choices = []
+    for year in range(today.year, today.year - 6, -1):
+        for quarter in range(4, 0, -1):
+            label = f"{year} Q{quarter}"
+            quarter_choices.append((label, year, quarter))
+    current_quarter = (today.month - 1) // 3 + 1
+    if current_quarter == 1:
+        default_year = today.year - 1
+        default_quarter = 4
     else:
-        st.info("The selected end date is treated as inclusive.")
+        default_year = today.year
+        default_quarter = current_quarter - 1
+    default_label = f"{default_year} Q{default_quarter}"
+    quarter_labels = [label for label, _, _ in quarter_choices]
+    default_selection = [default_label] if default_label in quarter_labels else quarter_labels[:1]
+    selected_quarters = st.multiselect(
+        "Choose one or more quarters to include",
+        options=quarter_labels,
+        default=default_selection
+    )
+    quarter_lookup = {label: (year, quarter) for label, year, quarter in quarter_choices}
 
-    st.subheader("3) Build and download")
+    st.subheader("3) Optional date range")
+    with st.expander("Add a custom date range", expanded=False):
+        start_date = st.date_input("Start date", value=None, key="custom_date_start")
+        end_date = st.date_input("End date", value=None, key="custom_date_end")
+        include_custom_range = st.checkbox(
+            "Include this date range",
+            value=False,
+            key="include_custom_range"
+        )
+
+        if include_custom_range:
+            if not start_date or not end_date:
+                st.warning("Provide both start and end dates to include the custom range.")
+            elif start_date > end_date:
+                st.warning("Start date must be on or before End date.")
+
+    st.subheader("4) Build and download")
     build_btn = st.button("Build Excel workbook", type="primary", use_container_width=True)
 
     if build_btn:
@@ -475,25 +608,45 @@ with tab_build:
             except Exception as e:
                 st.error(f"Failed to read/validate the uploaded file: {e}")
             else:
-                with st.spinner("Fetching data and generating workbook…"):
-                    wb_bytes = build_workbook_bytes(companies, start_date, end_date)
+                periods: list[dict] = []
+                for label in selected_quarters:
+                    if label not in quarter_lookup:
+                        continue
+                    year, quarter = quarter_lookup[label]
+                    try:
+                        q_start, q_end = quarter_date_range(year, quarter)
+                    except ValueError:
+                        continue
+                    periods.append({"label": label, "start": q_start, "end": q_end})
 
-                filename = f"companies_prices_{start_date}_to_{end_date}.xlsx"
-                st.success("Workbook is ready.")
-                st.download_button(
-                    label="Download Excel workbook",
-                    data=wb_bytes,
-                    file_name=filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                if include_custom_range and start_date and end_date and start_date <= end_date:
+                    periods.append({
+                        "label": f"Custom {start_date} to {end_date}",
+                        "start": start_date,
+                        "end": end_date,
+                    })
 
-                st.caption(
-                    "Workbook structure: sheet 'companies' mirrors your input. "
-                    "Each additional sheet is named by the company's 'No' and includes "
-                    "columns [Date, Price, Open, High, Low, Volume] plus a VWAP "
-                    "(weighted mean price) computed with Excel SUMPRODUCT."
-                )
+                if not periods:
+                    st.error("Select at least one quarter or include the custom date range before building.")
+                else:
+                    with st.spinner("Fetching data and generating workbook…"):
+                        wb_bytes = build_workbook_bytes(companies, periods)
+
+                    filename = f"companies_prices_{date.today()}.xlsx"
+                    st.success("Workbook is ready.")
+                    st.download_button(
+                        label="Download Excel workbook",
+                        data=wb_bytes,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+                    st.caption(
+                        "Workbook structure: sheet 'companies' mirrors your input. "
+                        "Each additional sheet is named by the company's 'No' and includes "
+                        "all requested periods in one table with per-period VWAP totals."
+                    )
 with tab_search:
     st.subheader("Search for tickers (via yfinance.Search)")
 
@@ -528,4 +681,6 @@ set_query_params(tab=active_tab_slug)
 
 # Footer note
 st.caption("Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
-           "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance.")
+           "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
+           "Select any quarters you need, keep the date range if desired, and the workbook will compute VWAP per period.")
+from xlsxwriter.utility import xl_col_to_name
