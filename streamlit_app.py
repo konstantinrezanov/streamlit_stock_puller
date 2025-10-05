@@ -167,46 +167,28 @@ def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.Data
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [_flatten_col_label(col) for col in df.columns]
 
-    def _norm_key(name: str) -> str:
-        return "".join(ch for ch in str(name).lower() if ch.isalnum())
+    normalized = {
+        _normalize_header(col): col for col in df.columns
+    }
 
-    candidates = [
-        ("open", "open"),
-        ("regularmarketopen", "open"),
-        ("high", "high"),
-        ("low", "low"),
-        ("close", "close"),
-        ("adjclose", "close"),
-        ("regularmarketclose", "close"),
-        ("volume", "volume"),
-        ("regularmarketvolume", "volume"),
-    ]
+    date_col = normalized.get("date") or normalized.get("datetime") or df.columns[0]
+    open_col = normalized.get("open") or normalized.get("regularmarketopen")
+    high_col = normalized.get("high")
+    low_col = normalized.get("low")
+    close_col = normalized.get("close") or normalized.get("regularmarketclose") or normalized.get("adjclose")
+    volume_col = normalized.get("volume") or normalized.get("regularmarketvolume")
 
-    colmap = {"open": None, "high": None, "low": None, "close": None, "volume": None}
-    for col in df.columns:
-        key = _norm_key(col)
-        for cand_key, target in candidates:
-            if colmap[target] is None and key == cand_key:
-                colmap[target] = col
-                break
-
-    try:
-        date_col = next(c for c in df.columns if _norm_key(c) in {"date", "datetime"})
-    except StopIteration:
-        date_col = df.columns[0]
-
-    if any(value is None for value in colmap.values()):
+    if not all([open_col, high_col, low_col, close_col, volume_col]):
         return pd.DataFrame()
 
-    ordered_cols = [colmap[label] for label in ["open", "high", "low", "close", "volume"]]
-    df = df[[date_col, *ordered_cols]]
+    df = df[[date_col, open_col, high_col, low_col, close_col, volume_col]]
     df = df.rename(columns={
         date_col: "Date",
-        colmap["open"]: "Open",
-        colmap["high"]: "High",
-        colmap["low"]: "Low",
-        colmap["close"]: "Close",
-        colmap["volume"]: "Volume",
+        open_col: "Open",
+        high_col: "High",
+        low_col: "Low",
+        close_col: "Close",
+        volume_col: "Volume",
     })
     # Rename to requested (English equivalents of Russian labels):
     # Дата -> Date, Цена -> Price (using Close), Откр. -> Open, Макс. -> High, Мин. -> Low, Объём -> Volume
