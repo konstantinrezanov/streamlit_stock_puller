@@ -2,6 +2,7 @@
 import io
 import calendar
 from datetime import date, timedelta
+import contextlib
 
 import json
 
@@ -149,17 +150,32 @@ def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.Data
     """
     # Ensure inclusive end date
     end_exclusive = end_d + timedelta(days=1)
+    err_buf = io.StringIO()
     try:
-        df = yf.download(
-            ticker,
-            start=start_d,
-            end=end_exclusive,
-            progress=False,
-            auto_adjust=False,  # keep raw OHLCV; you may switch to True if desired
-            threads=False
-        )
-    except Exception:
+        with contextlib.redirect_stderr(err_buf):
+            df = yf.download(
+                ticker,
+                start=start_d,
+                end=end_exclusive,
+                progress=False,
+                auto_adjust=False,  # keep raw OHLCV; you may switch to True if desired
+                threads=False
+            )
+    except Exception as e:
+        error_text = f"{type(e).__name__}: {e}"
+        if "YFRateLimitError" in error_text or "Rate limited" in error_text:
+            st.warning(
+                f"Yahoo Finance rate limit hit while fetching {ticker}. "
+                "Please try again later."
+            )
         df = pd.DataFrame()
+    else:
+        err_text = err_buf.getvalue()
+        if "YFRateLimitError" in err_text or "Rate limited" in err_text:
+            st.warning(
+                f"Yahoo Finance rate limit hit while fetching {ticker}. "
+                "Please try again later."
+            )
 
     if df is None or df.empty:
         return pd.DataFrame()
@@ -262,7 +278,7 @@ def autosize_columns(writer, sheet_name: str, df: pd.DataFrame, start_row=0, sta
             max_len = max(max_len, series_as_str.map(len).max())
         worksheet.set_column(start_col + i, start_col + i, max_len + extra_pad)
 
-def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
+def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame) -> str | None:
     """
     Write a per-company sheet:
     - Data table with columns: Date, Price, Open, High, Low, Volume
@@ -320,6 +336,7 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
     summary_col = start_col + len(columns_order) + 1
     worksheet.write(0, summary_col, "VWAP period", bold_fmt)
     worksheet.write(0, summary_col + 1, "Value", bold_fmt)
+    percent_fmt = workbook.add_format({"num_format": "0.00%"})
 
     def period_rows(label: str) -> tuple[int, int] | None:
         if not has_period:
@@ -332,6 +349,7 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
         return start_row, end_row
 
     current_summary_row = 1
+    unique_periods: list[str] = []
     if has_period:
         unique_periods = list(dict.fromkeys(df_prices["Period"].dropna().tolist()))
         for period_label in unique_periods:
@@ -363,6 +381,22 @@ def write_company_sheet(writer, sheet_name: str, df_prices: pd.DataFrame):
     )
     worksheet.write_formula(current_summary_row, summary_col + 1, overall_formula, money_fmt)
 
+    # Percent change between first and last selected periods (if >= 2 periods)
+    change_cell_ref = None
+    if has_period and len(unique_periods) >= 2:
+        change_row = current_summary_row + 1
+        worksheet.write(change_row, summary_col, "Change % (first->last)")
+        value_col_letter = xl_col_to_name(summary_col + 1)
+        first_row = 1
+        last_row = len(unique_periods)
+        first_cell = f"{value_col_letter}{first_row + 1}"
+        last_cell = f"{value_col_letter}{last_row + 1}"
+        change_formula = f"=IFERROR(({last_cell}-{first_cell})/{first_cell},\"\")"
+        worksheet.write_formula(change_row, summary_col + 1, change_formula, percent_fmt)
+        change_cell_ref = f"{value_col_letter}{change_row + 1}"
+
+    return change_cell_ref
+
 def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> bytes:
     """Build the Excel workbook in-memory and return as bytes."""
     output = io.BytesIO()
@@ -373,6 +407,12 @@ def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> byt
         companies_df.to_excel(writer, sheet_name="companies", index=False)
         autosize_columns(writer, "companies", companies_df, start_row=0, start_col=0, extra_pad=2)
         companies_ws = writer.sheets["companies"]
+        workbook = writer.book
+        bold_fmt = workbook.add_format({"bold": True})
+        percent_fmt = workbook.add_format({"num_format": "0.00%"})
+        change_col = len(companies_df.columns)
+        companies_ws.write(0, change_col, "Change % (first->last)", bold_fmt)
+        companies_ws.set_column(change_col, change_col, 20, percent_fmt)
 
         # Per company sheets
         per_company_periods = periods or []
@@ -425,7 +465,7 @@ def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> byt
             if collected_frames:
                 prices_df = pd.concat(collected_frames, ignore_index=True)
                 prices_df = prices_df.sort_values(["Period", "Date"]).reset_index(drop=True)
-                write_company_sheet(writer, sheet_name, prices_df)
+                change_cell_ref = write_company_sheet(writer, sheet_name, prices_df)
             else:
                 empty_df = pd.DataFrame(
                     columns=["Period", "Date", "Price", "Open", "High", "Low", "Volume"]
@@ -434,6 +474,7 @@ def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> byt
                 worksheet = writer.sheets[sheet_name]
                 worksheet.write("H2", "No data for the selected range/ticker.")
                 autosize_columns(writer, sheet_name, empty_df, start_row=0, start_col=0, extra_pad=2)
+                change_cell_ref = None
 
             # Add hyperlink from companies sheet "No" column to the corresponding sheet
             link_cell = f"A{idx + 1}"
@@ -444,6 +485,9 @@ def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> byt
                 f"internal:'{sheet_ref}'!A1",
                 string=display_text
             )
+            if change_cell_ref:
+                formula = f"='{sheet_ref}'!{change_cell_ref}"
+                companies_ws.write_formula(idx, change_col, formula, percent_fmt)
 
         if total:
             progress_bar.progress(1.0, text="All tickers fetched. Building workbook…")
