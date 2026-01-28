@@ -68,6 +68,12 @@ def quarter_date_range(year: int, quarter: int) -> tuple[date, date]:
     return start, end
 
 
+def year_date_range(year: int) -> tuple[date, date]:
+    start = date(year, 1, 1)
+    end = date(year, 12, 31)
+    return start, end
+
+
 def _run_async(coro):
     try:
         return asyncio.run(coro)
@@ -461,71 +467,6 @@ tab_build, tab_search = st.tabs(TAB_LABELS)
 tab_mapping_js = json.dumps(TAB_TO_SLUG)
 desired_slug_js = json.dumps(active_tab_slug)
 
-st.markdown(
-    f"""
-    <script>
-    (function syncTabs() {{
-        const TAB_MAPPING = {tab_mapping_js};
-        const desiredSlug = {desired_slug_js};
-        const root = window.parent && window.parent !== window ? window.parent : window;
-
-        function getTabs() {{
-            return Array.from(root.document.querySelectorAll('button[data-baseweb="tab"]'));
-        }}
-
-        function bindTabClicks(tabs) {{
-            tabs.forEach((tab) => {{
-                if (tab.dataset.tabSyncBound === 'true') {{
-                    return;
-                }}
-                tab.addEventListener('click', () => {{
-                    const label = tab.innerText.trim();
-                    const slug = TAB_MAPPING[label];
-                    if (!slug) {{
-                        return;
-                    }}
-                    const url = new URL(root.location.href);
-                    url.searchParams.set('tab', slug);
-                    const query = url.searchParams.toString();
-                    const newUrl = query ? `${{url.pathname}}?${{query}}` : url.pathname;
-                    root.history.replaceState(null, '', newUrl);
-                }});
-                tab.dataset.tabSyncBound = 'true';
-            }});
-        }}
-
-        function activateDesiredTab(tabs) {{
-            if (!desiredSlug) {{
-                return;
-            }}
-            const entry = Object.entries(TAB_MAPPING).find(([, slug]) => slug === desiredSlug);
-            if (!entry) {{
-                return;
-            }}
-            const [label] = entry;
-            const target = tabs.find((tab) => tab.innerText.trim() === label);
-            if (target && target.getAttribute('aria-selected') !== 'true') {{
-                target.click();
-            }}
-        }}
-
-        function init() {{
-            const tabs = getTabs();
-            if (!tabs.length) {{
-                window.setTimeout(init, 50);
-                return;
-            }}
-            bindTabClicks(tabs);
-            activateDesiredTab(tabs);
-        }}
-
-        init();
-    }})();
-    </script>
-    """,
-    unsafe_allow_html=True
-)
-
 with tab_build:
     st.subheader("1) Upload companies list")
     uploaded = st.file_uploader(
@@ -538,28 +479,49 @@ with tab_build:
 
     today = date.today()
 
-    st.subheader("2) Select quarters")
-    quarter_choices = []
-    for year in range(today.year, today.year - 6, -1):
-        for quarter in range(4, 0, -1):
-            label = f"{year} Q{quarter}"
-            quarter_choices.append((label, year, quarter))
-    current_quarter = (today.month - 1) // 3 + 1
-    if current_quarter == 1:
-        default_year = today.year - 1
-        default_quarter = 4
-    else:
-        default_year = today.year
-        default_quarter = current_quarter - 1
-    default_label = f"{default_year} Q{default_quarter}"
-    quarter_labels = [label for label, _, _ in quarter_choices]
-    default_selection = [default_label] if default_label in quarter_labels else quarter_labels[:1]
-    selected_quarters = st.multiselect(
-        "Choose one or more quarters to include",
-        options=quarter_labels,
-        default=default_selection
+    st.subheader("2) Select periods")
+    period_mode = st.radio(
+        "Period mode",
+        options=["Quarterly", "Yearly"],
+        horizontal=True
     )
-    quarter_lookup = {label: (year, quarter) for label, year, quarter in quarter_choices}
+
+    year_choices = list(range(today.year, today.year - 6, -1))
+
+    selected_quarters: list[str] = []
+    quarter_lookup: dict[str, tuple[int, int]] = {}
+    selected_years: list[int] = []
+
+    if period_mode == "Quarterly":
+        quarter_choices = []
+        for year in year_choices:
+            for quarter in range(4, 0, -1):
+                label = f"{year} Q{quarter}"
+                quarter_choices.append((label, year, quarter))
+        current_quarter = (today.month - 1) // 3 + 1
+        if current_quarter == 1:
+            default_year = today.year - 1
+            default_quarter = 4
+        else:
+            default_year = today.year
+            default_quarter = current_quarter - 1
+        default_label = f"{default_year} Q{default_quarter}"
+        quarter_labels = [label for label, _, _ in quarter_choices]
+        default_selection = [default_label] if default_label in quarter_labels else quarter_labels[:1]
+        selected_quarters = st.multiselect(
+            "Choose one or more quarters to include",
+            options=quarter_labels,
+            default=default_selection
+        )
+        quarter_lookup = {label: (year, quarter) for label, year, quarter in quarter_choices}
+    else:
+        default_year = today.year - 1
+        default_years = [default_year] if default_year in year_choices else year_choices[:1]
+        selected_years = st.multiselect(
+            "Choose one or more years to include",
+            options=year_choices,
+            default=default_years
+        )
 
     st.subheader("3) Optional date range")
     with st.expander("Add a custom date range", expanded=False):
@@ -591,15 +553,23 @@ with tab_build:
                 st.error(f"Failed to read/validate the uploaded file: {e}")
             else:
                 periods: list[dict] = []
-                for label in selected_quarters:
-                    if label not in quarter_lookup:
-                        continue
-                    year, quarter = quarter_lookup[label]
-                    try:
-                        q_start, q_end = quarter_date_range(year, quarter)
-                    except ValueError:
-                        continue
-                    periods.append({"label": label, "start": q_start, "end": q_end})
+                if period_mode == "Quarterly":
+                    for label in selected_quarters:
+                        if label not in quarter_lookup:
+                            continue
+                        year, quarter = quarter_lookup[label]
+                        try:
+                            q_start, q_end = quarter_date_range(year, quarter)
+                        except ValueError:
+                            continue
+                        periods.append({"label": label, "start": q_start, "end": q_end})
+                else:
+                    for year in selected_years:
+                        try:
+                            y_start, y_end = year_date_range(int(year))
+                        except ValueError:
+                            continue
+                        periods.append({"label": f"{int(year)}", "start": y_start, "end": y_end})
 
                 if include_custom_range and start_date and end_date and start_date <= end_date:
                     periods.append({
@@ -609,7 +579,7 @@ with tab_build:
                     })
 
                 if not periods:
-                    st.error("Select at least one quarter or include the custom date range before building.")
+                    st.error("Select at least one period or include the custom date range before building.")
                 else:
                     with st.spinner("Fetching data and generating workbook…"):
                         wb_bytes = build_workbook_bytes(companies, periods)
@@ -664,5 +634,5 @@ set_query_params(tab=active_tab_slug)
 # Footer note
 st.caption("Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
            "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
-           "Select any quarters you need, keep the date range if desired, and the workbook will compute VWAP per period.")
+           "Select the needed quarters or years, keep the date range if desired, and the workbook will compute VWAP per period.")
 from xlsxwriter.utility import xl_col_to_name
