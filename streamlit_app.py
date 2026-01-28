@@ -122,8 +122,7 @@ def normalize_companies_df(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"Missing required column: '{need}'")
         colmap[need] = candidates[0]
 
-    # Reorder and return
-    df = df[[colmap["No"], colmap["Name"], colmap["Ticker"], colmap["IsRussian"]]]
+    # Preserve original column order, but normalize required column names
     df = df.rename(columns={
         colmap["No"]: "No",
         colmap["Name"]: "Name",
