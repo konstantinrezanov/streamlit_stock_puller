@@ -411,8 +411,10 @@ def build_workbook_bytes(companies_df: pd.DataFrame, periods: list[dict]) -> byt
         bold_fmt = workbook.add_format({"bold": True})
         percent_fmt = workbook.add_format({"num_format": "0.00%"})
         change_col = len(companies_df.columns)
-        companies_ws.write(0, change_col, "Change % (first->last)", bold_fmt)
-        companies_ws.set_column(change_col, change_col, 20, percent_fmt)
+        change_header = "Change % (first->last)"
+        companies_ws.write(0, change_col, change_header, bold_fmt)
+        change_width = max(len(change_header), len("0.00%")) + 2
+        companies_ws.set_column(change_col, change_col, change_width, percent_fmt)
 
         # Per company sheets
         per_company_periods = periods or []
