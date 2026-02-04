@@ -25,9 +25,10 @@ st.set_page_config(
 # ---------- Helpers ----------
 REQUIRED_COLUMNS = ["No", "Name", "Ticker", "IsRussian"]
 
-TAB_LABELS = ["Build workbook", "Search ticker"]
+TAB_LABELS = ["Build workbook", "Financial metrics", "Search ticker"]
 TAB_TO_SLUG = {
     "Build workbook": "build",
+    "Financial metrics": "financials",
     "Search ticker": "search",
 }
 SLUG_TO_TAB = {slug: label for label, slug in TAB_TO_SLUG.items()}
@@ -141,6 +142,63 @@ def normalize_companies_df(df: pd.DataFrame) -> pd.DataFrame:
         .isin({"1", "y", "yes", "true", "да", "ru", "russia"})
     )
     return df
+
+@st.cache_data(show_spinner=False)
+def _get_income_statement(ticker: str, period_type: str) -> pd.DataFrame:
+    yf_ticker = yf.Ticker(ticker)
+    if period_type == "Annual":
+        stmt = getattr(yf_ticker, "income_stmt", None)
+        if stmt is None or stmt.empty:
+            stmt = getattr(yf_ticker, "financials", None)
+    else:
+        stmt = getattr(yf_ticker, "quarterly_income_stmt", None)
+        if stmt is None or stmt.empty:
+            stmt = getattr(yf_ticker, "quarterly_financials", None)
+
+    if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+        return pd.DataFrame()
+    return stmt.copy()
+
+def fetch_financials_for_ticker(ticker: str, period_type: str, max_periods: int) -> pd.DataFrame:
+    stmt = _get_income_statement(ticker, period_type)
+    if stmt is None or stmt.empty:
+        return pd.DataFrame()
+
+    normalized_index = { _normalize_header(idx): idx for idx in stmt.index }
+    revenue_label = normalized_index.get(_normalize_header("Total Revenue"))
+    net_label = normalized_index.get(_normalize_header("Net Income"))
+
+    period_cols = list(stmt.columns)
+    period_dates = pd.to_datetime(period_cols, errors="coerce")
+    order = sorted(
+        range(len(period_cols)),
+        key=lambda i: (pd.Timestamp.min if pd.isna(period_dates[i]) else period_dates[i]),
+        reverse=True
+    )
+    ordered_cols = [period_cols[i] for i in order][:max_periods]
+
+    rows = []
+    for col in ordered_cols:
+        period_end = pd.to_datetime(col, errors="coerce")
+        period_end_value = period_end.date() if pd.notna(period_end) else ""
+
+        gross_value = pd.NA
+        net_value = pd.NA
+        if revenue_label is not None:
+            gross_value = stmt.at[revenue_label, col]
+        if net_label is not None:
+            net_value = stmt.at[net_label, col]
+
+        rows.append({
+            "Ticker": ticker,
+            "Period Type": period_type,
+            "Period End": period_end_value,
+            "Gross Revenue": gross_value,
+            "Net Profit": net_value,
+            "Warning": "",
+        })
+
+    return pd.DataFrame(rows)
 
 def fetch_history_for_ticker(ticker: str, start_d: date, end_d: date) -> pd.DataFrame:
     """
@@ -507,7 +565,7 @@ active_tab_slug = tab_slug_from_url
 
 st.title("Ticker Workbook Builder")
 
-tab_build, tab_search = st.tabs(TAB_LABELS)
+tab_build, tab_financials, tab_search = st.tabs(TAB_LABELS)
 
 tab_mapping_js = json.dumps(TAB_TO_SLUG)
 desired_slug_js = json.dumps(active_tab_slug)
@@ -644,6 +702,110 @@ with tab_build:
                         "Each additional sheet is named by the company's 'No' and includes "
                         "all requested periods in one table with per-period VWAP totals."
                     )
+
+with tab_financials:
+    st.subheader("Financial metrics (Gross revenue, Net profit)")
+    st.caption("Gross revenue uses Yahoo Finance 'Total Revenue'. Net profit uses 'Net Income'.")
+
+    fin_uploaded = st.file_uploader(
+        "Upload an Excel file (.xlsx) with columns: No, Name, Ticker, IsRussian",
+        type=["xlsx"],
+        accept_multiple_files=False,
+        key="financials_upload"
+    )
+
+    period_type = st.radio(
+        "Period type",
+        options=["Quarterly", "Annual"],
+        horizontal=True,
+        key="financials_period_type"
+    )
+    max_periods = st.slider(
+        "Latest N periods",
+        min_value=1,
+        max_value=12,
+        value=4,
+        step=1,
+        key="financials_max_periods"
+    )
+
+    include_gross = st.checkbox("Gross revenue", value=True, key="financials_gross")
+    include_net = st.checkbox("Net profit", value=True, key="financials_net")
+
+    st.info("Russian tickers are skipped: MOEX does not provide income statements via this app's data source.")
+
+    fin_btn = st.button("Fetch financial metrics", type="primary", use_container_width=True, key="financials_fetch")
+
+    if fin_btn:
+        if fin_uploaded is None:
+            st.error("Please upload an Excel file with the required columns.")
+        elif not include_gross and not include_net:
+            st.error("Select at least one metric to fetch.")
+        else:
+            try:
+                raw_df = pd.read_excel(fin_uploaded)
+                companies = normalize_companies_df(raw_df)
+            except Exception as e:
+                st.error(f"Failed to read/validate the uploaded file: {e}")
+            else:
+                result_frames: list[pd.DataFrame] = []
+                total = len(companies)
+                progress = st.progress(0.0, text="Preparing to fetch financials…")
+                for idx, row in enumerate(companies.itertuples(index=False), start=1):
+                    ticker = str(getattr(row, "Ticker")).strip()
+                    is_russian = bool(getattr(row, "IsRussian"))
+                    progress_value = (idx - 1) / total if total else 1.0
+                    progress.progress(progress_value, text=f"Fetching {ticker} — {idx}/{total}")
+
+                    if is_russian:
+                        result_frames.append(pd.DataFrame([{
+                            "Ticker": ticker,
+                            "Period Type": period_type,
+                            "Period End": "",
+                            "Gross Revenue": pd.NA,
+                            "Net Profit": pd.NA,
+                            "Warning": "Financial statements not supported for MOEX tickers",
+                        }]))
+                        continue
+
+                    fin_df = fetch_financials_for_ticker(ticker, period_type, max_periods)
+                    if fin_df.empty:
+                        result_frames.append(pd.DataFrame([{
+                            "Ticker": ticker,
+                            "Period Type": period_type,
+                            "Period End": "",
+                            "Gross Revenue": pd.NA,
+                            "Net Profit": pd.NA,
+                            "Warning": "No income statement data",
+                        }]))
+                    else:
+                        result_frames.append(fin_df)
+
+                if result_frames:
+                    results = pd.concat(result_frames, ignore_index=True)
+                else:
+                    results = pd.DataFrame(
+                        columns=["Ticker", "Period Type", "Period End", "Gross Revenue", "Net Profit", "Warning"]
+                    )
+
+                if not include_gross and "Gross Revenue" in results.columns:
+                    results = results.drop(columns=["Gross Revenue"])
+                if not include_net and "Net Profit" in results.columns:
+                    results = results.drop(columns=["Net Profit"])
+
+                if "Period End" in results.columns:
+                    results = results.sort_values(
+                        by=["Ticker", "Period End"],
+                        ascending=[True, False],
+                        na_position="last"
+                    )
+
+                if total:
+                    progress.progress(1.0, text="All financials fetched.")
+                else:
+                    progress.progress(1.0, text="No companies supplied.")
+
+                st.dataframe(results, use_container_width=True)
 with tab_search:
     st.subheader("Search for tickers (via yfinance.Search)")
 
@@ -680,4 +842,3 @@ set_query_params(tab=active_tab_slug)
 st.caption("Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
            "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
            "Select the needed quarters or years, keep the date range if desired, and the workbook will compute VWAP per period.")
-from xlsxwriter.utility import xl_col_to_name
