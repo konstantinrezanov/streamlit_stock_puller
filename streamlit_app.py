@@ -837,6 +837,15 @@ with tab_search:
 set_query_params(tab=active_tab_slug)
 
 # Footer note
-st.caption("Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
-           "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
-           "Select the needed quarters or years, keep the date range if desired, and the workbook will compute VWAP per period.")
+if active_tab_slug == TAB_TO_SLUG["Financial metrics"]:
+    st.caption(
+        "Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
+        "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
+        "Select Annual or Quarterly and the latest N periods to fetch gross revenue and net profit."
+    )
+elif active_tab_slug == TAB_TO_SLUG["Stock performance"]:
+    st.caption(
+        "Tip: Ensure your Excel headers include 'No', 'Name', 'Ticker', 'IsRussian'. "
+        "Set 'IsRussian' to yes/true/1 for MOEX tickers; others are fetched via Yahoo Finance. "
+        "Select the needed quarters or years, keep the date range if desired, and the workbook will compute VWAP per period."
+    )
