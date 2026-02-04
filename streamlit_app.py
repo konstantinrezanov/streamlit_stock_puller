@@ -25,14 +25,14 @@ st.set_page_config(
 # ---------- Helpers ----------
 REQUIRED_COLUMNS = ["No", "Name", "Ticker", "IsRussian"]
 
-TAB_LABELS = ["Build workbook", "Financial metrics", "Search ticker"]
+TAB_LABELS = ["Stock performance", "Financial metrics", "Search ticker"]
 TAB_TO_SLUG = {
-    "Build workbook": "build",
+    "Stock performance": "performance",
     "Financial metrics": "financials",
     "Search ticker": "search",
 }
 SLUG_TO_TAB = {slug: label for label, slug in TAB_TO_SLUG.items()}
-DEFAULT_TAB_SLUG = TAB_TO_SLUG["Build workbook"]
+DEFAULT_TAB_SLUG = TAB_TO_SLUG["Stock performance"]
 
 
 def _first_value(value):
@@ -563,7 +563,7 @@ if tab_slug_from_url not in SLUG_TO_TAB:
 
 active_tab_slug = tab_slug_from_url
 
-st.title("Ticker Workbook Builder")
+st.title("Stock Performance Workbook")
 
 tab_build, tab_financials, tab_search = st.tabs(TAB_LABELS)
 
@@ -577,8 +577,6 @@ with tab_build:
         type=["xlsx"],
         accept_multiple_files=False
     )
-
-    st.checkbox("Show raw yfinance responses while building", key="show_raw_yf")
 
     today = date.today()
 
