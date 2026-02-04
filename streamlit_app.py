@@ -643,7 +643,7 @@ with tab_build:
                 st.warning("Start date must be on or before End date.")
 
     st.subheader("4) Build and download")
-    build_btn = st.button("Build Excel workbook", type="primary", use_container_width=True)
+    build_btn = st.button("Build Excel workbook", type="primary", width="stretch")
 
     if build_btn:
         if uploaded is None:
@@ -694,7 +694,7 @@ with tab_build:
                         data=wb_bytes,
                         file_name=filename,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
+                        width="stretch"
                     )
 
                     st.caption(
@@ -734,7 +734,7 @@ with tab_financials:
 
     st.info("Russian tickers are skipped: MOEX does not provide income statements via this app's data source.")
 
-    fin_btn = st.button("Fetch financial metrics", type="primary", use_container_width=True, key="financials_fetch")
+    fin_btn = st.button("Fetch financial metrics", type="primary", width="stretch", key="financials_fetch")
 
     if fin_btn:
         if fin_uploaded is None:
@@ -805,12 +805,12 @@ with tab_financials:
                 else:
                     progress.progress(1.0, text="No companies supplied.")
 
-                st.dataframe(results, use_container_width=True)
+                st.dataframe(results, width="stretch")
 with tab_search:
     st.subheader("Search for tickers (via yfinance.Search)")
 
     query = st.text_input("Enter a company name or ticker keyword:", "")
-    search_btn = st.button("Search", use_container_width=True)
+    search_btn = st.button("Search", width="stretch")
 
     if search_btn and query.strip():
         try:
